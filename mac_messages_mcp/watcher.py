@@ -105,7 +105,8 @@ def _message_payload(row: dict, chat_mapping: dict) -> dict | None:
     }
 
 
-def _post(url: str, token: str, payload: dict, timeout: float = 15.0) -> bool:
+def _post(url: str, token: str, payload: dict, timeout: float = 15.0) -> str:
+    """POST one message. Returns 'ok', 'rate_limited', or 'error'."""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -119,13 +120,13 @@ def _post(url: str, token: str, payload: dict, timeout: float = 15.0) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+            return "ok" if 200 <= resp.status < 300 else "error"
     except urllib.error.HTTPError as e:
         print(f"[watcher] POST {url} -> {e.code}: {e.read()[:200]!r}", flush=True)
-        return False
+        return "rate_limited" if e.code == 429 else "error"
     except Exception as e:
         print(f"[watcher] POST {url} failed: {e}", flush=True)
-        return False
+        return "error"
 
 
 def main() -> int:
@@ -162,7 +163,9 @@ def main() -> int:
 
     print(f"[watcher] watching for inbound messages > ROWID {last_rowid}, posting to {args.url}", flush=True)
 
+    backoff = args.interval
     while True:
+        rate_limited = False
         try:
             rows = query_messages_db(POLL_QUERY, (last_rowid,))
             if rows and "error" in rows[0]:
@@ -173,14 +176,25 @@ def main() -> int:
                 chat_mapping = get_chat_mapping()
                 for row in rows:
                     payload = _message_payload(row, chat_mapping)
-                    if payload is not None and not _post(args.url, token, payload):
-                        break  # retry this message next tick; don't advance past it
+                    if payload is not None:
+                        result = _post(args.url, token, payload)
+                        if result != "ok":
+                            # Retry this message next tick; don't advance past it.
+                            rate_limited = result == "rate_limited"
+                            break
                     last_rowid = int(row["ROWID"])
                     _save_state(state_path, last_rowid)
         except Exception as e:
             print(f"[watcher] poll error: {e}", flush=True)
 
-        time.sleep(args.interval)
+        if rate_limited:
+            # The receiver's fixed window is per minute — retrying every few
+            # seconds just keeps the window saturated. Back off exponentially.
+            backoff = min(backoff * 2, 120.0)
+            print(f"[watcher] rate limited — backing off {backoff:.0f}s", flush=True)
+        else:
+            backoff = args.interval
+        time.sleep(backoff)
 
 
 if __name__ == "__main__":
