@@ -266,17 +266,44 @@ def tool_check_addressbook(ctx: Context) -> str:
 @mcp.tool()
 def tool_get_chats(ctx: Context) -> str:
     """
-    List named group chats from the macOS Messages database.
+    List group chats from the macOS Messages database, most recent first.
 
-    This is read-only: it queries chat identifiers and display names and does not
-    send, edit, or delete messages. Requires Full Disk Access for the host app or
-    terminal. Returns a plain-text numbered list of group names and IDs. Use this
+    This is read-only: it queries chat identifiers, display names, and
+    participants and does not send, edit, or delete messages. Requires Full
+    Disk Access for the host app or terminal. Returns a plain-text numbered
+    list of group names (or participants for unnamed groups) and IDs. Use this
     before tool_send_message with group_chat=true; use tool_get_recent_messages
     when you need message contents instead of chat IDs.
     """
     logger.info("Getting available chats")
     try:
-        query = "SELECT chat_identifier, display_name FROM chat WHERE display_name IS NOT NULL"
+        # style = 43 is a group chat. Unnamed groups (common on macOS 26,
+        # where display_name is often empty) are identified by participants.
+        # Business chats (urn:biz:…) are excluded — they are 1:1 brand chats.
+        # Correlated subqueries (not joins) — joining chat_handle_join ×
+        # chat_message_join produces a cartesian row explosion, and handles
+        # repeat per service (iMessage/SMS/RCS) without DISTINCT.
+        query = """
+            SELECT
+                c.chat_identifier,
+                c.display_name,
+                (
+                    SELECT GROUP_CONCAT(DISTINCT h.id)
+                    FROM chat_handle_join chj
+                    JOIN handle h ON h.ROWID = chj.handle_id
+                    WHERE chj.chat_id = c.ROWID
+                ) AS participants,
+                (
+                    SELECT MAX(m.date)
+                    FROM chat_message_join cmj
+                    JOIN message m ON m.ROWID = cmj.message_id
+                    WHERE cmj.chat_id = c.ROWID
+                ) AS last_activity
+            FROM chat c
+            WHERE c.style = 43 AND c.chat_identifier NOT LIKE 'urn:%'
+            ORDER BY last_activity DESC
+            LIMIT 75
+        """
         results = query_messages_db(query)
 
         if not results:
@@ -285,19 +312,21 @@ def tool_get_chats(ctx: Context) -> str:
         if "error" in results[0]:
             return f"Error accessing chats: {results[0]['error']}"
 
-        # Filter out chats without display names and format the results
-        chats = [r for r in results if r.get("display_name")]
-
-        if not chats:
-            return "No named group chats found."
-
         formatted_chats = []
-        for i, chat in enumerate(chats, 1):
-            formatted_chats.append(
-                f"{i}. {chat['display_name']} (ID: {chat['chat_identifier']})"
-            )
+        for i, chat in enumerate(results, 1):
+            name = (chat.get("display_name") or "").strip()
+            if not name:
+                participants = [
+                    p.strip() for p in (chat.get("participants") or "").split(",") if p.strip()
+                ]
+                shown = ", ".join(participants[:4])
+                extra = len(participants) - 4
+                name = f"(unnamed: {shown}{f' +{extra} more' if extra > 0 else ''})"
+            formatted_chats.append(f"{i}. {name} (ID: {chat['chat_identifier']})")
 
-        return "Available group chats:\n" + "\n".join(formatted_chats)
+        return "Available group chats (most recent first):\n" + "\n".join(
+            formatted_chats
+        )
     except Exception as e:
         logger.error(f"Error getting chats: {str(e)}")
         return f"Error getting chats: {str(e)}"

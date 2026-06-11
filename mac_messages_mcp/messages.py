@@ -6,12 +6,14 @@ import difflib
 import glob
 import json
 import os
+import platform
 import re
 import sqlite3
 import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server.fastmcp import Image
@@ -206,6 +208,143 @@ def _format_phone_for_messages(phone: str) -> str:
 def _looks_like_phone_input(value: str) -> bool:
     """True when the input is intended as a phone number, not a contact name."""
     return bool(value) and all(c.isdigit() or c in "+- ()" for c in value)
+
+
+# ─── macOS 26 (Tahoe) compatibility ──────────────────────────────────────────
+#
+# macOS 26 broke the AppleScript constructs this package historically relied
+# on for sending:
+#
+#   * `1st service whose service type = iMessage` raises -1728 — service
+#     `name` / `service type` properties no longer resolve (only `id` does).
+#   * Chat GUIDs changed prefix from `iMessage;-;…` / `SMS;-;…` to `any;-;…`
+#     (and `any;+;<hex>` for groups), so callers holding legacy-prefixed or
+#     bare identifiers can no longer be matched verbatim.
+#
+# What still works on macOS 26 (verified on 26.3):
+#
+#   * `send … to chat id "<guid>"` where <guid> is the chat's current GUID
+#     exactly as stored in chat.db.
+#   * `participant "<handle>" of service id "<uuid>"` where <uuid> comes from
+#     `get id of every service` (still functional) — needed only for brand-new
+#     conversations with no existing chat row.
+#
+# The helpers below resolve recipients to current chat GUIDs via chat.db so
+# one send path works on both old and new macOS.
+
+
+@lru_cache(maxsize=1)
+def _macos_major_version() -> int:
+    """Best-effort macOS major version (e.g. 15, 26). 0 when undetectable."""
+    try:
+        return int(platform.mac_ver()[0].split(".")[0] or 0)
+    except (ValueError, IndexError):
+        return 0
+
+
+# Prefer service-agnostic Tahoe chats, then iMessage, then RCS, then SMS when
+# multiple chats exist for the same handle.
+_GUID_PREFERENCE_SQL = """
+    CASE
+        WHEN guid LIKE 'any;%' THEN 0
+        WHEN guid LIKE 'iMessage;%' THEN 1
+        WHEN guid LIKE 'RCS;%' THEN 2
+        ELSE 3
+    END
+"""
+
+
+def _find_existing_chat_guid(recipient: str) -> Optional[str]:
+    """Resolve a 1:1 recipient (phone/email) to its current chat GUID, if any.
+
+    Tries the raw value plus normalized phone variants against
+    chat.chat_identifier, and the raw value against chat.guid (callers may
+    already hold a full GUID).
+    """
+    if not recipient:
+        return None
+
+    candidates = [recipient]
+    if "@" not in recipient:
+        normalized = normalize_phone_number(recipient)
+        if normalized:
+            candidates.extend(_get_phone_formats(normalized))
+
+    seen = set()
+    candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+    placeholders = ", ".join("?" for _ in candidates)
+    rows = query_messages_db(
+        f"""
+        SELECT guid FROM chat
+        WHERE guid = ? OR chat_identifier IN ({placeholders})
+        ORDER BY {_GUID_PREFERENCE_SQL}, ROWID DESC
+        LIMIT 1
+        """,
+        (recipient, *candidates),
+    )
+    if rows and "error" not in rows[0] and rows[0].get("guid"):
+        return rows[0]["guid"]
+    return None
+
+
+def _resolve_group_chat_guid(identifier: str) -> Optional[str]:
+    """Resolve a group chat reference to its current GUID.
+
+    Accepts a bare chat_identifier (legacy ``chat123…`` or Tahoe hex), a full
+    GUID, or a stale full GUID whose service prefix has since changed (e.g. a
+    stored ``iMessage;+;chat123`` for a chat that is now ``any;+;chat123``).
+    """
+    if not identifier:
+        return None
+
+    rows = query_messages_db(
+        f"""
+        SELECT guid FROM chat
+        WHERE guid = ? OR chat_identifier = ?
+        ORDER BY {_GUID_PREFERENCE_SQL}, ROWID DESC
+        LIMIT 1
+        """,
+        (identifier, identifier),
+    )
+    if rows and "error" not in rows[0] and rows[0].get("guid"):
+        return rows[0]["guid"]
+
+    # Stale full GUID: retry with the bare identifier after the last ';'.
+    if ";" in identifier:
+        bare = identifier.rsplit(";", 1)[-1]
+        if bare and bare != identifier:
+            return _resolve_group_chat_guid(bare)
+    return None
+
+
+def _get_send_service_ids() -> List[str]:
+    """Service UUIDs usable for new conversations, most-recently-used first.
+
+    AppleScript `id of every service` still works on macOS 26 while service
+    name/type lookups do not. Cross-reference with chat.db account_id usage so
+    we try the account that actually sent messages most recently before any
+    other live service.
+    """
+    live = run_applescript('tell application "Messages" to get id of every service')
+    if live.startswith("Error:"):
+        return []
+    live_ids = [part.strip() for part in live.split(",") if part.strip()]
+
+    rows = query_messages_db(
+        """
+        SELECT account_id, MAX(ROWID) AS recency FROM chat
+        WHERE account_id IS NOT NULL AND account_id != ''
+        GROUP BY account_id
+        ORDER BY recency DESC
+        """
+    )
+    db_ids = []
+    if rows and "error" not in rows[0]:
+        db_ids = [r["account_id"] for r in rows if r.get("account_id")]
+
+    recent_live = [i for i in db_ids if i in live_ids]
+    return recent_live + [i for i in live_ids if i not in recent_live]
 
 
 # Global cache for contacts map
@@ -791,28 +930,50 @@ def _send_message_to_recipient(
         finally:
             tmp.close()
 
-        # Adjust the AppleScript command based on whether this is a group chat
-        if not group_chat:
-            command = f'tell application "Messages" to send (read (POSIX file "{safe_file_path}") as «class utf8») to participant "{safe_recipient}" of (1st service whose service type = iMessage)'
-        else:
-            # Group chats are addressed by their full chat id (e.g. "iMessage;+;chat123…").
-            # The Messages dictionary requires `chat id "…"`, NOT `chat "…"`:
-            # the latter looks up by the chat's display name and fails for guid-style
-            # identifiers (raises -1728 "Can't get chat …").
-            command = f'tell application "Messages" to send (read (POSIX file "{safe_file_path}") as «class utf8») to chat id "{safe_recipient}"'
-
-        # Run the AppleScript
-        result = run_applescript(command)
-
-        # Check result
-        if result.startswith("Error:"):
-            # Try fallback to direct method
-            return _send_message_direct(recipient, message, contact_name, group_chat)
-
-        # Message sent successfully
+        # File-based payload survives emoji, newlines, and quoting edge cases.
+        payload = f'(read (POSIX file "{safe_file_path}") as «class utf8»)'
         display_name = contact_name if contact_name else recipient
-        return f"Message sent successfully to {display_name}"
-    except Exception as e:
+
+        # Ordered send strategies, generated lazily so expensive lookups
+        # (service enumeration) only happen when earlier attempts fail.
+        # Sending to an existing chat by its current GUID is the only path
+        # that works across all macOS versions including 26 (Tahoe);
+        # service-based targeting is required only when no conversation
+        # exists yet.
+        def _attempts():
+            if group_chat:
+                guid = _resolve_group_chat_guid(recipient)
+                if guid:
+                    yield f'tell application "Messages" to send {payload} to chat id "{escape_applescript(guid)}"'
+                # Last resort: identifier as given (covers a guid not yet in our db).
+                yield f'tell application "Messages" to send {payload} to chat id "{safe_recipient}"'
+                return
+
+            guid = _find_existing_chat_guid(recipient)
+            if guid:
+                yield f'tell application "Messages" to send {payload} to chat id "{escape_applescript(guid)}"'
+            # Legacy service-type targeting — works on macOS < 26 and creates
+            # new conversations there.
+            yield f'tell application "Messages" to send {payload} to participant "{safe_recipient}" of (1st service whose service type = iMessage)'
+            # macOS 26: service name/type lookups raise -1728, but services
+            # still resolve by id. Needed for brand-new conversations.
+            if _macos_major_version() >= 26:
+                for service_id in _get_send_service_ids():
+                    yield f'tell application "Messages" to send {payload} to participant "{safe_recipient}" of service id "{escape_applescript(service_id)}"'
+
+        errors: List[str] = []
+        for command in _attempts():
+            result = run_applescript(command)
+            if not result.startswith("Error:"):
+                return f"Message sent successfully to {display_name}"
+            errors.append(result)
+
+        # Every strategy failed — fall back to the legacy combined script.
+        fallback = _send_message_direct(recipient, message, contact_name, group_chat)
+        if fallback.startswith("Error") and errors:
+            return f"{fallback} (previous attempts: {' | '.join(errors[:3])})"
+        return fallback
+    except Exception:
         # Try fallback method
         return _send_message_direct(recipient, message, contact_name, group_chat)
     finally:
@@ -906,9 +1067,11 @@ def _find_chat_by_identifier(chat_id: str) -> Optional[Dict[str, Any]]:
     if chat_id.startswith("chat"):
         variants.add(f"iMessage;-;{chat_id}")
         variants.add(f"iMessage;+;{chat_id}")
-    elif chat_id.startswith("iMessage;"):
+    elif ";" in chat_id:
+        # Full GUID with any service prefix (iMessage;, SMS;, or macOS 26's
+        # any;) — also try the bare identifier after the last ';'.
         short_id = chat_id.rsplit(";", 1)[-1]
-        if short_id.startswith("chat"):
+        if short_id:
             variants.add(short_id)
 
     placeholders = ", ".join(["?" for _ in variants])
@@ -1428,6 +1591,17 @@ def _send_message_sms(recipient: str, message: str, contact_name: str = None) ->
     """
     safe_message = escape_applescript(message)
     safe_recipient = escape_applescript(recipient)
+    display_name = contact_name if contact_name else recipient
+
+    # Existing conversation: send by chat GUID — the only SMS path that works
+    # on macOS 26, and harmless on earlier versions.
+    guid = _find_existing_chat_guid(recipient)
+    if guid:
+        result = run_applescript(
+            f'tell application "Messages" to send "{safe_message}" to chat id "{escape_applescript(guid)}"'
+        )
+        if not result.startswith("Error:"):
+            return f"SMS sent successfully to {display_name}"
 
     script = f"""
     tell application "Messages"
@@ -1453,7 +1627,6 @@ def _send_message_sms(recipient: str, message: str, contact_name: str = None) ->
         if result.startswith("error:"):
             return f"Error sending SMS: {result[6:]}"
         elif result.strip() == "success":
-            display_name = contact_name if contact_name else recipient
             return f"SMS sent successfully to {display_name}"
         else:
             return f"Unknown SMS result: {result}"
@@ -1488,13 +1661,17 @@ def _send_message_direct(
 
     # For group chats, stick to iMessage only (SMS doesn't support group chats well)
     if group_chat:
+        # Resolve to the chat's current GUID (handles macOS 26 `any;+;…`
+        # prefixes and bare identifiers); fall back to the value as given.
+        resolved = _resolve_group_chat_guid(recipient)
+        safe_chat_id = escape_applescript(resolved) if resolved else safe_recipient
         script = f"""
         tell application "Messages"
             try
                 -- Try to get the existing chat by its full id (e.g. "iMessage;+;chat123…").
                 -- `chat id "…"` looks up by guid; plain `chat "…"` looks up by display
                 -- name and fails on guid-style identifiers with -1728 "Can't get chat".
-                set targetChat to chat id "{safe_recipient}"
+                set targetChat to chat id "{safe_chat_id}"
                 
                 -- Send the message
                 send "{safe_message}" to targetChat

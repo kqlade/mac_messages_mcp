@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-10
+
+### Fixed
+- macOS 26 (Tahoe) send support. Tahoe broke `1st service whose service type = iMessage` (error -1728) and changed chat GUID prefixes to `any;-;…` / `any;+;<hex>`, which broke every send path. Sends now resolve the recipient's existing chat GUID from chat.db and target `chat id "<guid>"` directly, which works on all macOS versions. New conversations on Tahoe target services by `service id` (still functional) instead of by service type.
+- Group sends accept bare chat identifiers (legacy `chat123…` or Tahoe hex), full GUIDs, or stale-prefixed GUIDs — all are resolved to the chat's current GUID before sending.
+- `tool_get_chats` now lists group chats by `style = 43` (instead of requiring a display name), includes unnamed groups identified by participants, orders by recent activity, and excludes `urn:biz:` brand chats. On Tahoe most new group chats have no display name and were previously invisible.
+- SMS sends try the existing conversation GUID first, which is the only SMS path that works on Tahoe.
+
 ## [0.9.2] - 2026-05-10
 
 ### Added
