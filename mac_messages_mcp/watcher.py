@@ -65,11 +65,12 @@ def _save_state(path: Path, last_rowid: int) -> None:
     tmp.replace(path)
 
 
-def _current_max_rowid() -> int:
+def _current_max_rowid() -> int | None:
+    """Current head ROWID, or None when chat.db is unreadable (e.g. no FDA)."""
     rows = query_messages_db(MAX_ROWID_QUERY)
     if rows and "error" not in rows[0]:
         return int(rows[0]["max_rowid"])
-    return 0
+    return None
 
 
 def _message_payload(row: dict, chat_mapping: dict) -> dict | None:
@@ -146,9 +147,16 @@ def main() -> int:
 
     state_path = Path(args.state_file).expanduser()
     last_rowid = _load_state(state_path)
-    if last_rowid < 0:
-        # First run: start at the current head — never flood history.
-        last_rowid = _current_max_rowid()
+    while last_rowid < 0:
+        # First run: start at the current head — never flood history. If the
+        # DB is unreadable (FDA not granted yet), keep waiting; persisting a
+        # bogus cursor here would replay the entire history once access works.
+        head = _current_max_rowid()
+        if head is None:
+            print("[watcher] chat.db unreadable (Full Disk Access?) — retrying", flush=True)
+            time.sleep(max(args.interval, 15.0))
+            continue
+        last_rowid = head
         _save_state(state_path, last_rowid)
         print(f"[watcher] initialized cursor at ROWID {last_rowid}", flush=True)
 
@@ -156,7 +164,7 @@ def main() -> int:
 
     while True:
         try:
-            rows = query_messages_db(POLL_QUERY, (str(last_rowid),))
+            rows = query_messages_db(POLL_QUERY, (last_rowid,))
             if rows and "error" in rows[0]:
                 print(f"[watcher] chat.db error: {rows[0]['error']}", flush=True)
                 rows = []
