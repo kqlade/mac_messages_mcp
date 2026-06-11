@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mac-messages-mcp"
-version = "0.10.0"
+version = "0.11.0"
 description = "A bridge for interacting with macOS Messages app through MCP"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -47,6 +47,7 @@ dev = [
 [project.scripts]
 mac-messages-mcp = "mac_messages_mcp.server:run_server"
 mac_messages_mcp = "mac_messages_mcp.server:run_server"
+mac-messages-watch = "mac_messages_mcp.watcher:main"
 
 [tool.setuptools]
 packages = ["mac_messages_mcp"]
