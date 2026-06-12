@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-11
+
+### Changed
+- `mac-messages-watch` now batches inbound messages instead of POSTing one webhook per message. A batch flushes after a quiet window with no new inbound texts (`--quiet-window`, default 90s) or once the oldest buffered message has waited `--max-batch-wait` (default 420s). The payload is `{"event_type": "imessages_batch", "count", "conversations", "messages": [...]}` with the previous per-message fields inside `messages`; idempotency key is `imessage-batch-<min_rowid>-<max_rowid>`. The delivery cursor still only advances on 2xx, and a restart rebuilds the buffer from chat.db, so batching does not weaken at-least-once delivery.
+
 ## [0.10.0] - 2026-06-10
 
 ### Fixed
