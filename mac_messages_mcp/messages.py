@@ -1089,22 +1089,222 @@ def _find_chat_by_identifier(chat_id: str) -> Optional[Dict[str, Any]]:
     return rows[0]
 
 
+def _parse_user_datetime(value: str) -> Optional[datetime]:
+    """Parse a user-supplied date/datetime string into an aware UTC datetime.
+
+    Accepts ``YYYY-MM-DD``, ``YYYY-MM-DD HH:MM[:SS]`` and ISO-8601 forms (``/``
+    is accepted in place of ``-``). Naive values are interpreted in the host's
+    local timezone. Returns None when the string cannot be parsed.
+    """
+    if not value:
+        return None
+    candidate = value.strip().replace("/", "-")
+    if not candidate:
+        return None
+    dt: Optional[datetime] = None
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ):
+        try:
+            dt = datetime.strptime(candidate, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # interpret naive input as local time
+    return dt.astimezone(timezone.utc)
+
+
+# Default and hard-ceiling row counts for a single get_recent_messages call.
+# Callers page through deep history with offset; the default stays small so
+# routine "recent context" reads don't dump huge windows into the model.
+_RECENT_MESSAGES_DEFAULT_LIMIT = 100
+_RECENT_MESSAGES_MAX_LIMIT = 1_000
+
+
+def _resolve_message_filter(
+    contact: Optional[str], chat_id: Optional[str]
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Resolve optional contact/chat_id filters into shared query parameters.
+
+    Returns ``(resolved, early_return)``:
+
+    * ``resolved`` -- dict with ``handle_ids`` (list[int] | None), ``chat_row_id``
+      (int | None) and ``chat_display_name`` (str | None). All None when no
+      filter is requested.
+    * ``early_return`` -- when not None, a plain-text string the caller must
+      return immediately (a validation error, a "no history" notice, or a
+      multi-match disambiguation prompt).
+
+    Shared by get_recent_messages and fuzzy_search_messages so that contact and
+    group-chat scoping behave identically in both.
+    """
+    resolved: Dict[str, Any] = {
+        "handle_ids": None,
+        "chat_row_id": None,
+        "chat_display_name": None,
+    }
+
+    if contact and chat_id:
+        return resolved, "Error: Provide either contact or chat_id, not both."
+
+    if chat_id:
+        chat_id = str(chat_id).strip()
+        if not chat_id:
+            return resolved, "Error: chat_id cannot be empty."
+        chat = _find_chat_by_identifier(chat_id)
+        if not chat:
+            return (
+                resolved,
+                f"No group chat found with chat_id '{chat_id}'. "
+                "Use tool_get_chats to list available group chats.",
+            )
+        resolved["chat_row_id"] = chat["ROWID"]
+        resolved["chat_display_name"] = chat.get("display_name") or chat_id
+        return resolved, None
+
+    if not contact:
+        return resolved, None
+
+    # Convert to string to ensure phone numbers work properly
+    contact = str(contact).strip()
+
+    # Handle contact selection format (contact:N)
+    if contact.lower().startswith("contact:"):
+        try:
+            contact_parts = contact.split(":", 1)
+            if len(contact_parts) < 2 or not contact_parts[1].strip():
+                return (
+                    resolved,
+                    "Error: Invalid contact selection format. Use 'contact:N' where N is a positive number.",
+                )
+            try:
+                index = int(contact_parts[1].strip()) - 1
+            except ValueError:
+                return (
+                    resolved,
+                    "Error: Contact selection must be a number. Use 'contact:N' where N is a positive number.",
+                )
+            if index < 0:
+                return (
+                    resolved,
+                    "Error: Contact selection must be a positive number (starting from 1).",
+                )
+            if (
+                not hasattr(get_recent_messages, "recent_matches")
+                or not get_recent_messages.recent_matches
+            ):
+                return (
+                    resolved,
+                    "No recent contact matches available. Please search for a contact first.",
+                )
+            if index >= len(get_recent_messages.recent_matches):
+                return (
+                    resolved,
+                    f"Invalid selection. Please choose a number between 1 and {len(get_recent_messages.recent_matches)}.",
+                )
+            contact = get_recent_messages.recent_matches[index]["phone"]
+        except Exception as e:
+            return resolved, f"Error processing contact selection: {str(e)}"
+
+    # A name (rather than a phone/email) needs an AddressBook lookup first.
+    if not all(c.isdigit() or c in "+- ()@." for c in contact):
+        matches = find_contact_by_name(contact)
+        if not matches:
+            return resolved, f"No contacts found matching '{contact}'."
+        if len(matches) == 1:
+            contact = matches[0]["phone"]
+        else:
+            get_recent_messages.recent_matches = matches
+            contact_list = "\n".join(
+                [
+                    f"{i+1}. {c['name']} ({c['phone']})"
+                    for i, c in enumerate(matches[:10])
+                ]
+            )
+            return (
+                resolved,
+                "Multiple contacts found matching "
+                f"'{contact}'. Please specify which one using 'contact:N' "
+                f"where N is the number:\n{contact_list}",
+            )
+
+    # contact is now a phone number or email -- resolve to handle ROWIDs.
+    if "@" in contact:
+        query = "SELECT ROWID FROM handle WHERE id = ?"
+        results = query_messages_db(query, (contact,))
+        if results and "error" not in results[0] and len(results) > 0:
+            resolved["handle_ids"] = [row["ROWID"] for row in results]
+    else:
+        resolved["handle_ids"] = find_handles_by_phone(contact)
+
+    if not resolved["handle_ids"]:
+        # Fall back to a direct LIKE probe so we can distinguish "no history"
+        # from "couldn't resolve the handle at all".
+        normalized = normalize_phone_number(contact)
+        probe = """
+        SELECT COUNT(*) as count
+        FROM message m
+        JOIN handle h ON m.handle_id = h.ROWID
+        WHERE h.id LIKE ?
+        """
+        results = query_messages_db(probe, (f"%{normalized}%",))
+        if (
+            results
+            and "error" not in results[0]
+            and results[0].get("count", 0) == 0
+        ):
+            return resolved, f"No message history found with '{contact}'."
+        return (
+            resolved,
+            f"Could not find any messages with contact '{contact}'. "
+            "Verify the phone number or email is correct.",
+        )
+
+    return resolved, None
+
+
 def get_recent_messages(
     hours: int = 24,
     contact: Optional[str] = None,
     chat_id: Optional[str] = None,
+    limit: int = _RECENT_MESSAGES_DEFAULT_LIMIT,
+    offset: int = 0,
+    order: str = "desc",
+    before: Optional[str] = None,
+    after: Optional[str] = None,
 ) -> str:
     """
-    Get recent messages from the Messages app using attributedBody for content.
+    Get messages from the Messages app using attributedBody for content.
 
     Args:
-        hours: Number of hours to look back (default: 24)
-        contact: Filter by contact name, phone number, or email (optional)
-                Use "contact:N" to select a specific contact from previous matches
-        chat_id: Filter by group chat identifier from tool_get_chats (optional)
+        hours: Number of hours to look back (default: 24). Use 0 for no lower
+               time bound (combine with order/offset to page from the oldest
+               message, or with before/after to target a specific window).
+        contact: Filter by contact name, phone number, or email (optional).
+                Use "contact:N" to select a specific contact from previous matches.
+        chat_id: Filter by group chat identifier from tool_get_chats (optional).
+        limit: Maximum messages to return (default: 100, capped at 1000).
+        offset: Number of messages to skip for pagination (default: 0). With
+                order="desc" this skips the newest; with order="asc" the oldest.
+        order: "desc" (newest first, default) or "asc" (oldest first). Use "asc"
+               with offset to walk forward through old history a page at a time.
+        before: Only messages strictly before this date/datetime (optional).
+                Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS".
+        after: Only messages strictly after this date/datetime (optional). When
+               set, this overrides the hours lower bound.
 
     Returns:
-        Formatted string with recent messages
+        Formatted string with the matching messages
     """
     # Input validation
     if hours < 0:
@@ -1115,124 +1315,50 @@ def get_recent_messages(
     if hours > MAX_HOURS:
         return f"Error: Hours value too large. Maximum allowed is {MAX_HOURS} hours (10 years)."
 
-    if contact and chat_id:
-        return "Error: Provide either contact or chat_id, not both."
+    # Normalise pagination / ordering inputs.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _RECENT_MESSAGES_DEFAULT_LIMIT
+    limit = max(1, min(limit, _RECENT_MESSAGES_MAX_LIMIT))
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    order_sql = "ASC" if str(order).strip().lower() == "asc" else "DESC"
 
-    handle_ids = None
-    chat_row_id = None
-    chat_display_name = None
+    # Resolve optional contact / group-chat scoping (shared with fuzzy search).
+    resolved, early_return = _resolve_message_filter(contact, chat_id)
+    if early_return is not None:
+        return early_return
+    handle_ids = resolved["handle_ids"]
+    chat_row_id = resolved["chat_row_id"]
+    chat_display_name = resolved["chat_display_name"]
 
-    if chat_id:
-        chat_id = str(chat_id).strip()
-        if not chat_id:
-            return "Error: chat_id cannot be empty."
-        chat = _find_chat_by_identifier(chat_id)
-        if not chat:
-            return f"No group chat found with chat_id '{chat_id}'. Use tool_get_chats to list available group chats."
-        chat_row_id = chat["ROWID"]
-        chat_display_name = chat.get("display_name") or chat_id
+    # Resolve the lower time bound: explicit `after` wins, else the hours
+    # look-back, else "0" (all history -- needed when paging oldest-first).
+    after_dt = _parse_user_datetime(after) if after else None
+    if after and after_dt is None:
+        return (
+            f"Error: Could not parse 'after' value '{after}'. "
+            "Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'."
+        )
+    before_dt = _parse_user_datetime(before) if before else None
+    if before and before_dt is None:
+        return (
+            f"Error: Could not parse 'before' value '{before}'. "
+            "Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'."
+        )
 
-    # If contact is specified, try to resolve it
-    if contact:
-        # Convert to string to ensure phone numbers work properly
-        contact = str(contact).strip()
-
-        # Handle contact selection format (contact:N)
-        if contact.lower().startswith("contact:"):
-            try:
-                # Extract the number after the colon
-                contact_parts = contact.split(":", 1)
-                if len(contact_parts) < 2 or not contact_parts[1].strip():
-                    return "Error: Invalid contact selection format. Use 'contact:N' where N is a positive number."
-
-                # Get the selected index (1-based)
-                try:
-                    index = int(contact_parts[1].strip()) - 1
-                except ValueError:
-                    return "Error: Contact selection must be a number. Use 'contact:N' where N is a positive number."
-
-                # Validate index is not negative
-                if index < 0:
-                    return "Error: Contact selection must be a positive number (starting from 1)."
-
-                # Get the most recent contact matches from global cache
-                if (
-                    not hasattr(get_recent_messages, "recent_matches")
-                    or not get_recent_messages.recent_matches
-                ):
-                    return "No recent contact matches available. Please search for a contact first."
-
-                if index >= len(get_recent_messages.recent_matches):
-                    return f"Invalid selection. Please choose a number between 1 and {len(get_recent_messages.recent_matches)}."
-
-                # Get the selected contact's phone number
-                contact = get_recent_messages.recent_matches[index]["phone"]
-            except Exception as e:
-                return f"Error processing contact selection: {str(e)}"
-
-        # Check if contact might be a name rather than a phone number or email
-        # If any character is NOT a phone/email character, treat as a name
-        if not all(c.isdigit() or c in "+- ()@." for c in contact):
-            # Try fuzzy matching
-            matches = find_contact_by_name(contact)
-
-            if not matches:
-                return f"No contacts found matching '{contact}'."
-
-            if len(matches) == 1:
-                # Single match, use its phone number
-                contact = matches[0]["phone"]
-            else:
-                # Store the matches for later selection
-                get_recent_messages.recent_matches = matches
-
-                # Multiple matches, return them all
-                contact_list = "\n".join(
-                    [
-                        f"{i+1}. {c['name']} ({c['phone']})"
-                        for i, c in enumerate(matches[:10])
-                    ]
-                )
-                return f"Multiple contacts found matching '{contact}'. Please specify which one using 'contact:N' where N is the number:\n{contact_list}"
-
-        # At this point, contact should be a phone number or email
-        # Try to find handle_ids with improved phone number matching
-        if "@" in contact:
-            # This is an email
-            query = "SELECT ROWID FROM handle WHERE id = ?"
-            results = query_messages_db(query, (contact,))
-            if results and not "error" in results[0] and len(results) > 0:
-                handle_ids = [row["ROWID"] for row in results]
-        else:
-            # This is a phone number - try various formats (returns all handles for multi-protocol)
-            handle_ids = find_handles_by_phone(contact)
-
-        if not handle_ids:
-            # Try a direct search in message table to see if any messages exist
-            normalized = normalize_phone_number(contact)
-            query = """
-            SELECT COUNT(*) as count 
-            FROM message m
-            JOIN handle h ON m.handle_id = h.ROWID
-            WHERE h.id LIKE ?
-            """
-            results = query_messages_db(query, (f"%{normalized}%",))
-
-            if (
-                results
-                and not "error" in results[0]
-                and results[0].get("count", 0) == 0
-            ):
-                # No messages found but the query was valid
-                return f"No message history found with '{contact}'."
-            else:
-                # Could not find the handle at all
-                return f"Could not find any messages with contact '{contact}'. Verify the phone number or email is correct."
-
-    # Calculate the timestamp for X hours ago
-    hours_ago = datetime.now(timezone.utc) - timedelta(hours=hours)
-    # String-bind the Apple-ns timestamp to avoid SQLite integer overflow.
-    timestamp_str = str(_to_apple_ns(hours_ago))
+    # String-bind Apple-ns timestamps to avoid SQLite integer overflow.
+    if after_dt is not None:
+        timestamp_str = str(_to_apple_ns(after_dt))
+    elif hours > 0:
+        timestamp_str = str(
+            _to_apple_ns(datetime.now(timezone.utc) - timedelta(hours=hours))
+        )
+    else:
+        timestamp_str = "0"  # year-2001 epoch: include the entire history
 
     # Build the SQL query - use attributedBody field and text
     query = """
@@ -1252,6 +1378,11 @@ def get_recent_messages(
 
     params = [timestamp_str]
 
+    # Optional upper time bound (same fixed-width Apple-ns TEXT comparison).
+    if before_dt is not None:
+        query += "AND CAST(m.date AS TEXT) < ? "
+        params.append(str(_to_apple_ns(before_dt)))
+
     # Add contact filter if handle_ids were found (support multiple handles for multi-protocol)
     if handle_ids:
         placeholders = ", ".join(["?" for _ in handle_ids])
@@ -1262,7 +1393,9 @@ def get_recent_messages(
         query += "AND m.ROWID IN (SELECT message_id FROM chat_message_join WHERE chat_id = ?) "
         params.append(chat_row_id)
 
-    query += "ORDER BY m.date DESC LIMIT 100"
+    # limit/offset are validated ints above, so inlining them is injection-safe
+    # and keeps the bound-parameter order stable for existing callers/tests.
+    query += f"ORDER BY m.date {order_sql} LIMIT {limit} OFFSET {offset}"
 
     # Execute the query
     messages = query_messages_db(query, tuple(params))
@@ -1328,7 +1461,14 @@ def get_recent_messages(
     if not formatted_messages:
         return "No messages found in the specified time period."
 
-    return "\n".join(formatted_messages)
+    body = "\n".join(formatted_messages)
+    if len(messages) >= limit:
+        body += (
+            f"\n\n[Page full ({len(messages)} messages, order={order_sql.lower()}, "
+            f"offset={offset}); more may exist. Call again with offset="
+            f"{offset + limit} to continue, or use before/after to target a window.]"
+        )
+    return body
 
 
 # Initialize the static variable for recent matches
@@ -1349,6 +1489,8 @@ def fuzzy_search_messages(
     search_term: str,
     hours: int = 720,
     threshold: float = 0.6,  # Default threshold adjusted for thefuzz
+    contact: Optional[str] = None,
+    chat_id: Optional[str] = None,
 ) -> str:
     """
     Fuzzy search for messages containing the search_term within the last N hours.
@@ -1359,6 +1501,13 @@ def fuzzy_search_messages(
                Use 0 to search all messages with no time limit.
         threshold: Minimum similarity score (0.0-1.0) to consider a match (default: 0.6 for WRatio).
                    A lower threshold allows for more lenient matching.
+        contact: Restrict the search to one conversation by contact name, phone,
+                 or email (optional). Use "contact:N" to pick from previous
+                 matches. Scoping is the reliable way to search deep history: the
+                 result cap then applies to that single thread instead of every
+                 conversation, so it reaches years further back.
+        chat_id: Restrict the search to one group chat from tool_get_chats
+                 (optional). Mutually exclusive with contact.
 
     Returns:
         Formatted string with matching messages and their scores, or an error/no results message.
@@ -1399,6 +1548,29 @@ def fuzzy_search_messages(
         where_clauses.insert(0, "CAST(m.date AS TEXT) > ?")
         params_list.insert(0, timestamp_str)
         time_desc = f"the last {hours} hours"
+
+    # Optional contact / group-chat scoping (shared with get_recent_messages).
+    # Scoping to one conversation means the soft cap bounds *that thread's*
+    # messages, so the search reaches far further back than an unscoped one.
+    resolved, early_return = _resolve_message_filter(contact, chat_id)
+    if early_return is not None:
+        return early_return
+    if resolved["handle_ids"]:
+        placeholders = ", ".join(["?" for _ in resolved["handle_ids"]])
+        where_clauses.append(f"m.handle_id IN ({placeholders})")
+        params_list.extend(resolved["handle_ids"])
+    if resolved["chat_row_id"] is not None:
+        where_clauses.append(
+            "m.ROWID IN (SELECT message_id FROM chat_message_join WHERE chat_id = ?)"
+        )
+        params_list.append(resolved["chat_row_id"])
+
+    if resolved["chat_display_name"]:
+        scope_desc = f" in chat '{resolved['chat_display_name']}'"
+    elif contact:
+        scope_desc = f" with '{contact}'"
+    else:
+        scope_desc = ""
 
     params_list.append(_FUZZY_SEARCH_SOFT_CAP)
     where_sql = " AND ".join(where_clauses)
@@ -1468,7 +1640,7 @@ def fuzzy_search_messages(
     )  # Sort by score desc
 
     if not matched_messages_with_scores:
-        return f"No messages found matching '{search_term}' with a threshold of {threshold} in {time_desc}."
+        return f"No messages found matching '{search_term}'{scope_desc} with a threshold of {threshold} in {time_desc}."
 
     truncated = len(raw_messages) >= _FUZZY_SEARCH_SOFT_CAP
 
@@ -1512,11 +1684,16 @@ def fuzzy_search_messages(
             f"{message_prefix} {direction}: {original_body}{attachment_summary}"
         )
 
-    header = f"Found {len(matched_messages_with_scores)} messages matching '{search_term}':\n"
+    header = f"Found {len(matched_messages_with_scores)} messages matching '{search_term}'{scope_desc}:\n"
     if truncated:
+        note = (
+            "narrow the time window"
+            if scope_desc
+            else "pass a contact or chat_id to scope, or narrow the time window"
+        )
         header += (
-            f"(Results capped at {_FUZZY_SEARCH_SOFT_CAP} messages — "
-            "try a shorter time window for more precise results.)\n"
+            f"(Scanned the most recent {_FUZZY_SEARCH_SOFT_CAP} messages{scope_desc} — "
+            f"older matches may exist; {note} for full coverage.)\n"
         )
     return header + "\n".join(formatted_results)
 

@@ -66,21 +66,65 @@ def tool_get_recent_messages(
             )
         ),
     ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum messages to return. Default 100, capped at 1000.",
+            ge=1,
+        ),
+    ] = 100,
+    offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Messages to skip, for paging through history. Default 0. Combine "
+                'with order="asc" to walk forward from the oldest message.'
+            ),
+            ge=0,
+        ),
+    ] = 0,
+    order: Annotated[
+        str,
+        Field(
+            description='Sort order: "desc" (newest first, default) or "asc" (oldest first).',
+        ),
+    ] = "desc",
+    before: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional upper bound: only messages before this date/datetime. "
+                'Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS".'
+            )
+        ),
+    ] = None,
+    after: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional lower bound: only messages after this date/datetime. "
+                "Overrides hours when set. Same formats as before."
+            )
+        ),
+    ] = None,
 ) -> str:
     """
-    Read recent macOS Messages as a plain-text summary.
+    Read macOS Messages as a plain-text summary.
 
     This is read-only: it queries the local Messages database and does not send,
     edit, or delete messages. Requires macOS Full Disk Access for the host app or
     terminal. Returns sanitized message text, timestamps, participants, and compact
     attachment markers when files are present. Use contact for one-to-one
-    conversations or chat_id for a group conversation, but not both. Use this when
-    you need chronological recent context; use tool_fuzzy_search_messages when
-    searching for specific text, and tool_get_chats when you only need group chat
-    IDs.
+    conversations or chat_id for a group conversation, but not both. To read deep
+    history for one conversation, set contact (or chat_id) and either page with
+    order="asc" plus offset, or target a window with before/after. Use this for
+    chronological context; use tool_fuzzy_search_messages to search for specific
+    text, and tool_get_chats when you only need group chat IDs.
     """
     logger.info(
-        f"Getting recent messages: hours={hours}, contact={contact}, chat_id={chat_id}"
+        "Getting recent messages: "
+        f"hours={hours}, contact={contact}, chat_id={chat_id}, "
+        f"limit={limit}, offset={offset}, order={order}, before={before}, after={after}"
     )
     try:
         # Handle contacts that are passed as numbers
@@ -88,7 +132,20 @@ def tool_get_recent_messages(
             contact = str(contact)
         if chat_id is not None:
             chat_id = str(chat_id)
-        result = get_recent_messages(hours=hours, contact=contact, chat_id=chat_id)
+        if before is not None:
+            before = str(before)
+        if after is not None:
+            after = str(after)
+        result = get_recent_messages(
+            hours=hours,
+            contact=contact,
+            chat_id=chat_id,
+            limit=limit,
+            offset=offset,
+            order=str(order),
+            before=before,
+            after=after,
+        )
         return result
     except Exception as e:
         logger.error(f"Error in get_recent_messages: {str(e)}")
@@ -396,6 +453,26 @@ def tool_fuzzy_search_messages(
             le=1.0,
         ),
     ] = 0.6,
+    contact: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional: restrict the search to one conversation by contact "
+                'name, phone, email, or "contact:N" from a previous match list. '
+                "Strongly preferred for deep-history searches -- the result cap "
+                "then applies to that single thread, reaching years further back."
+            )
+        ),
+    ] = None,
+    chat_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional: restrict the search to one group chat from "
+                "tool_get_chats. Mutually exclusive with contact."
+            )
+        ),
+    ] = None,
 ) -> str:
     """
     Fuzzy-search local message text within a time window.
@@ -404,8 +481,11 @@ def tool_fuzzy_search_messages(
     edit, or delete messages. Requires Full Disk Access for the host app or
     terminal. Returns a plain-text list of matching messages with similarity
     scores, timestamps, participants, sanitized bodies, and attachment markers
-    when present. Use this for approximate text search; use tool_get_recent_messages
-    for unfiltered chronological context and tool_find_contact for contact lookup.
+    when present. Pass contact (or chat_id) to scope the search to one
+    conversation -- this is the reliable way to reach deep history, since the
+    result cap then bounds that single thread instead of every conversation. Use
+    this for approximate text search; use tool_get_recent_messages for
+    chronological context and tool_find_contact for contact lookup.
     """
     if not (0.0 <= threshold <= 1.0):
         return "Error: Threshold must be between 0.0 and 1.0."
@@ -413,11 +493,20 @@ def tool_fuzzy_search_messages(
         return "Error: Hours cannot be negative."
 
     logger.info(
-        f"Tool: Fuzzy searching messages for '{search_term}' in last {hours} hours with threshold {threshold}"
+        f"Tool: Fuzzy searching messages for '{search_term}' in last {hours} hours "
+        f"with threshold {threshold}, contact={contact}, chat_id={chat_id}"
     )
     try:
+        if contact is not None:
+            contact = str(contact)
+        if chat_id is not None:
+            chat_id = str(chat_id)
         result = fuzzy_search_messages(
-            search_term=search_term, hours=hours, threshold=threshold
+            search_term=search_term,
+            hours=hours,
+            threshold=threshold,
+            contact=contact,
+            chat_id=chat_id,
         )
         return result
     except Exception as e:

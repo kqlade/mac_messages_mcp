@@ -267,7 +267,7 @@ wheels = [
 
 [[package]]
 name = "mac-messages-mcp"
-version = "0.10.0"
+version = "0.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
